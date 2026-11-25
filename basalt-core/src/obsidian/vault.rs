@@ -751,6 +751,56 @@ impl Vault {
         let name = basename(&restored_path, Some("md"))?;
         Note::try_from((name, restored_path))
     }
+
+    /// Backs up `note` into the vault's `.trash` directory and then deletes the original file,
+    /// returning the path to the backup file in `.trash`.
+    ///
+    /// The backup is always completed before removing the original file so the deletion can be
+    /// undone with [`Vault::restore`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `note` is outside this vault or contains `..` path components, if
+    /// creating the backup fails (in which case the original note is not deleted), or if
+    /// removing the original file fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs;
+    /// use tempfile::tempdir;
+    /// use basalt_core::obsidian::{self, Vault, Error};
+    ///
+    /// let tmp_dir = tempdir()?;
+    /// let vault = Vault { path: tmp_dir.path().to_path_buf(), ..Default::default() };
+    /// let note = obsidian::vault::create_note(&vault.path, "Note")?;
+    /// fs::write(note.path(), "important content")?;
+    ///
+    /// let backup_path = vault.delete_note(note.clone())?;
+    /// assert!(!note.path().exists());
+    /// assert_eq!(fs::read_to_string(&backup_path)?, "important content");
+    ///
+    /// let restored = vault.restore(&backup_path)?;
+    /// assert_eq!(restored.path(), note.path());
+    /// assert_eq!(fs::read_to_string(restored.path())?, "important content");
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn delete_note(&self, note: Note) -> result::Result<PathBuf, Error> {
+        let note_path = note.path();
+        let trash_dir = backup::dir(&self.path);
+        if note_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+            || !note_path.starts_with(&self.path)
+            || note_path.starts_with(&trash_dir)
+        {
+            return Err(Error::InvalidPathName(note_path.to_path_buf()));
+        }
+
+        let backup_path = backup::create(trash_dir, note_path)?;
+        fs::remove_file(note_path)?;
+        Ok(backup_path)
+    }
 }
 
 impl<'de> Deserialize<'de> for Vault {
@@ -886,5 +936,73 @@ mod tests {
 
         let result = vault.restore("../outside.md");
         assert!(matches!(result, Err(Error::InvalidPathName(_))));
+    }
+
+    #[test]
+    fn delete_note_backs_up_to_trash_before_removing() {
+        let dir = tempdir().unwrap();
+        let vault = Vault {
+            path: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let note = create_note(&vault.path, "/notes/Draft").unwrap();
+        fs::write(note.path(), "draft body").unwrap();
+
+        let backup_path = vault.delete_note(note.clone()).unwrap();
+
+        assert!(!note.path().exists());
+        assert_eq!(backup_path, backup::dir(&vault.path).join("Draft.md"));
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), "draft body");
+        assert_eq!(
+            backup::file_entries(backup::dir(&vault.path)).unwrap(),
+            vec![backup_path]
+        );
+    }
+
+    #[test]
+    fn delete_note_preserves_previous_backup_on_repeated_deletes() {
+        let dir = tempdir().unwrap();
+        let vault = Vault {
+            path: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let first_note = create_note(&vault.path, "Same").unwrap();
+        fs::write(first_note.path(), "v1").unwrap();
+        let first_backup = vault.delete_note(first_note).unwrap();
+
+        let second_note = create_note(&vault.path, "Same").unwrap();
+        fs::write(second_note.path(), "v2").unwrap();
+        let second_backup = vault.delete_note(second_note).unwrap();
+
+        assert_ne!(first_backup, second_backup);
+        assert_eq!(fs::read_to_string(first_backup).unwrap(), "v1");
+        assert_eq!(fs::read_to_string(second_backup).unwrap(), "v2");
+    }
+
+    #[test]
+    fn delete_note_rejects_missing_and_outside_vault_notes() {
+        let vault_dir = tempdir().unwrap();
+        let other_dir = tempdir().unwrap();
+        let vault = Vault {
+            path: vault_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let missing = Note::new_unchecked("Missing", &vault.path.join("Missing.md"));
+        assert!(matches!(
+            vault.delete_note(missing),
+            Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!backup::dir(&vault.path).exists());
+
+        let outside_path = other_dir.path().join("Outside.md");
+        fs::write(&outside_path, "keep me").unwrap();
+        let outside = Note::try_from(("Outside", outside_path.clone())).unwrap();
+        assert!(matches!(
+            vault.delete_note(outside),
+            Err(Error::InvalidPathName(_))
+        ));
+        assert!(outside_path.exists());
     }
 }
